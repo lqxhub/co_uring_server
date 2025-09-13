@@ -58,17 +58,34 @@ Task<true> IoUring::acceptServer() {
 Task<false> IoUring::startSession(int fd, uint64_t connId) {
   std::string buffer;
   buffer.resize(1024);
-  while (true) {
-    auto res = co_await AwaitableRead(this, fd, buffer);
-    if (res <= 0) {
+  bool closed = false;
+  while (!closed) {
+    auto aRead = AwaitableRead(this, fd, buffer);
+    while (true) {
+      int res = co_await aRead;
+      if (res <= 0) { // 连接关闭或者读取错误
+        closed = true;
+        break;
+      }
+      if (res == 1) { // 读完了
+        break;
+      }
+    }
+    if (closed) {
       break;
     }
-    std::cout << "Received data: ";
-    std::cout.write(buffer.data(), res);
-    std::cout << std::endl;
-    res = co_await AwaitableWrite(this, fd, std::move(std::string(buffer)));
-    if (res <= 0) {
-      break;
+
+    std::string response = buffer;
+    auto aWrite = AwaitableWrite(this, fd, std::move(std::string(response)));
+    while (true) {
+      int res = co_await aWrite;
+      if (res < 0) { // 写出错了
+        closed = true;
+        break;
+      }
+      if (res == 0) { // 写完了
+        break;
+      }
     }
   }
   close(fd);

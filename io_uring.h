@@ -118,8 +118,8 @@ class AwaitableRead {
   IoUring *uring_ = nullptr;
   int fd_ = 0;
   std::string &buffer_;
-
   AwaitableBaseOp *op_ = nullptr;
+  bool readOver_ = false;
 
 public:
   explicit AwaitableRead(IoUring *ring, const int fd, std::string &buffer)
@@ -140,7 +140,9 @@ public:
   bool await_ready() const noexcept { return false; }
 
   void await_suspend(std::coroutine_handle<> h) {
-    op_ = new AwaitableBaseOp(h);
+    if (!op_) {
+      op_ = new AwaitableBaseOp(h);
+    }
 
     io_uring_sqe *sqe = io_uring_get_sqe(&uring_->Uring());
     io_uring_prep_recv(sqe, fd_, buffer_.data(), buffer_.size(), 0);
@@ -148,10 +150,36 @@ public:
     io_uring_submit(&uring_->Uring());
   }
 
-  int await_resume() const noexcept {
+  // 0 连接关闭
+  // 1 正确读取
+  // 2 继续读取
+  //-1 读取错误
+  int await_resume() noexcept {
     int res = op_->GetRes();
-    delete op_;
-    return res;
+    int err = 0;
+    readOver_ = false;
+    if (res == 0) { // 连接关闭
+      readOver_ = true;
+    } else if (res < 0) {
+      if (res != -EAGAIN && res != -EINTR) { // 其他错误，关闭连接
+        readOver_ = true;
+        err = -1;
+      } else { // 继续读
+        err = 2;
+      }
+    } else { // 正确读取
+      if (res < buffer_.size()) {
+        readOver_ = true; // 读完了
+        err = 1;
+      } else {
+        err = 2; // 继续读
+      }
+    }
+    if (readOver_) {
+      delete op_;
+      op_ = nullptr;
+    }
+    return err;
   }
 };
 
@@ -160,6 +188,8 @@ class AwaitableWrite {
   int fd_ = 0;
   std::string buffer_;
   AwaitableBaseOp *op_ = nullptr;
+
+  int offset_ = 0;
 
 public:
   AwaitableWrite(IoUring *ring, int fd, std::string &&buffer)
@@ -180,17 +210,30 @@ public:
   bool await_ready() const noexcept { return false; }
 
   void await_suspend(std::coroutine_handle<> h) {
-    op_ = new AwaitableBaseOp(h);
+    if (!op_) {
+      op_ = new AwaitableBaseOp(h);
+    }
 
     io_uring_sqe *sqe = io_uring_get_sqe(&uring_->Uring());
-    io_uring_prep_write(sqe, fd_, buffer_.data(), buffer_.size(), 0);
+    io_uring_prep_write(sqe, fd_, buffer_.data() + offset_,
+                        buffer_.size() - offset_, 0);
     io_uring_sqe_set_data(sqe, op_);
     io_uring_submit(&uring_->Uring());
   }
 
-  int await_resume() const noexcept {
+  int await_resume() noexcept {
     int res = op_->GetRes();
-    delete op_;
+    if (res < 0) {
+      delete op_;
+      op_ = nullptr;
+      return res; // 写错误
+    }
+    offset_ += res;
+    if (offset_ == buffer_.size()) {
+      delete op_;
+      op_ = nullptr;
+      return 0;
+    }
     return res;
   }
 };
